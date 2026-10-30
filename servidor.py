@@ -11,7 +11,7 @@ ROOMS = {}
 LOCK = threading.RLock()
 def clean_avatar(value):
     value=value if isinstance(value,dict) else {}
-    limits={'shape':7,'color':5,'face':2,'hat':4}
+    limits={'shape':11,'color':5,'face':2,'hat':4}
     return {key:max(0,min(limit,v)) if isinstance(v:=value.get(key,0),int) else 0 for key,limit in limits.items()}
 
 def make_questions(count):
