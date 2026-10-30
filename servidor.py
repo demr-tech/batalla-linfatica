@@ -9,6 +9,17 @@ ROOT = Path(__file__).resolve().parent
 BANK = json.loads((ROOT / 'preguntas.json').read_text(encoding='utf-8'))
 ROOMS = {}
 LOCK = threading.RLock()
+def clean_avatar(value):
+    value=value if isinstance(value,dict) else {}
+    limits={'shape':2,'color':5,'face':2,'hat':4}
+    return {key:max(0,min(limit,v)) if isinstance(v:=value.get(key,0),int) else 0 for key,limit in limits.items()}
+
+def make_questions(count):
+    questions=[]
+    for row in random.sample(BANK,count):
+        pairs=list(enumerate(row[1])); random.shuffle(pairs)
+        questions.append(dict(text=row[0],options=[p[1] for p in pairs],correct=next(i for i,p in enumerate(pairs) if p[0]==0),explanation=row[2],kind=row[3]))
+    return questions
 POOL = None
 if os.environ.get('DATABASE_URL'):
     from psycopg_pool import ConnectionPool
@@ -49,7 +60,8 @@ def view(r, token):
     host = secrets.compare_digest(r['host'], token)
     p = r['players'].get(token)
     if not host and p is None: raise ValueError('Vuelve a entrar a la sala.')
-    result = dict(phase=r['phase'], code=r['code'], host=host, index=r['index'] + 1, total=len(r['questions']), deadline=r.get('deadline',0), now=time.time(), players=sorted([dict(name=p['name'], score=p['score'], answered=p['answer'] is not None) for p in r['players'].values()], key=lambda p:-p['score']))
+    result = dict(phase=r['phase'], code=r['code'], host=host, index=r['index'] + 1, total=len(r['questions']), deadline=r.get('deadline',0), now=time.time(), players=sorted([dict(name=p['name'], score=p['score'], avatar=clean_avatar(p.get('avatar')), answered=p['answer'] is not None) for p in r['players'].values()], key=lambda p:-p['score']))
+    result['run']=r.get('run','initial')
     if r['phase'] in ('question','reveal'):
         q = r['questions'][r['index']]
         result['question'] = dict(text=q['text'], options=q['options'], kind=q['kind'])
@@ -64,6 +76,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header('Content-Type',mime+'; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin'); self.send_header('Content-Length',str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def do_GET(self):
         if self.path.split('?')[0] in ('/','/index.html'): self.send((ROOT/'index.html').read_bytes(),mime='text/html')
+        elif self.path=='/fiesta.js': self.send((ROOT/'fiesta.js').read_bytes(),mime='text/javascript')
+        elif self.path=='/fiesta.css': self.send((ROOT/'fiesta.css').read_bytes(),mime='text/css')
         elif urlparse(self.path).path=='/qr.svg':
             code=parse_qs(urlparse(self.path).query).get('sala',[''])[0]
             if len(code)!=6 or not code.isascii() or not code.isdigit():
@@ -95,15 +109,11 @@ class Handler(BaseHTTPRequestHandler):
                 if action=='/api/create':
                     code=str(secrets.randbelow(900000)+100000)
                     while code in rooms: code=str(secrets.randbelow(900000)+100000)
-                    questions=[]
                     count=int(d.get('count',15))
                     if count not in (10,15,30): raise ValueError('Elige 10, 15 o 30 preguntas.')
-                    for row in random.sample(BANK,count):
-                        pairs=list(enumerate(row[1])); random.shuffle(pairs)
-                        questions.append(dict(text=row[0],options=[p[1] for p in pairs],correct=next(i for i,p in enumerate(pairs) if p[0]==0),explanation=row[2],kind=row[3]))
-                    if not questions: raise ValueError('Selecciona al menos una pregunta.')
+                    questions=make_questions(count)
                     token=secrets.token_urlsafe(24)
-                    rooms[code]=dict(code=code,host=token,questions=questions,phase='lobby',index=-1,players={})
+                    rooms[code]=dict(code=code,host=token,hostAvatar=clean_avatar(d.get('avatar')),run=secrets.token_hex(6),questions=questions,phase='lobby',index=-1,players={})
                     return dict(code=code,token=token)
                 code=str(d.get('code','')); token=str(d.get('token','')); r=rooms.get(code)
                 if r is None: raise ValueError('No encontramos esa sala. Revisa el código.')
@@ -113,15 +123,27 @@ class Handler(BaseHTTPRequestHandler):
                     if not name: raise ValueError('Escribe tu apodo.')
                     if len(r['players'])>=80: raise ValueError('La sala está llena.')
                     if any(p['name'].casefold()==name.casefold() for p in r['players'].values()): raise ValueError('Ese apodo ya está en uso.')
-                    token=secrets.token_urlsafe(24); r['players'][token]=dict(name=name,score=0,answer=None,gain=0,streak=0,best=0,hits=0)
+                    token=secrets.token_urlsafe(24); r['players'][token]=dict(name=name,avatar=clean_avatar(d.get('avatar')),score=0,answer=None,gain=0,streak=0,best=0,hits=0)
                     return dict(code=code,token=token)
                 if token!=r['host'] and token not in r['players']: raise ValueError('Sesión no válida.')
+                if action=='/api/leave':
+                    if token==r['host']: r['phase']='closed'
+                    else:
+                        r['players'].pop(token,None)
+                        advance(r)
+                    return {'ok':True}
+                if action=='/api/restart':
+                    if token!=r['host']: raise ValueError('Solo el anfitrión puede reiniciar la partida.')
+                    if r['phase']=='closed': raise ValueError('La sala ya está cerrada.')
+                    r.update(phase='lobby',index=-1,run=secrets.token_hex(6),questions=make_questions(len(r['questions'])))
+                    for p in r['players'].values(): p.update(score=0,answer=None,gain=0,streak=0,best=0,hits=0)
+                    return view(r,token)
                 advance(r)
                 if action=='/api/next':
                     if token!=r['host']: raise ValueError('Solo el anfitrión puede avanzar.')
                     if r['phase']=='question': raise ValueError('La ronda todavía está en marcha.')
                     if r['phase']=='lobby' and not r['players']:
-                        r['players'][token]=dict(name='Tú · modo individual',score=0,answer=None,gain=0,streak=0,best=0,hits=0)
+                        r['players'][token]=dict(name='Tú · modo individual',avatar=clean_avatar(r.get('hostAvatar')),score=0,answer=None,gain=0,streak=0,best=0,hits=0)
                     if r['phase'] not in ('lobby','reveal'): raise ValueError('La partida terminó.')
                     r['index']+=1
                     if r['index']>=len(r['questions']): r['phase']='finished'
