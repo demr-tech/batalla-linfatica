@@ -2,6 +2,8 @@ import json, time, secrets, random, threading, socket, webbrowser, os
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from contextlib import contextmanager
+from urllib.parse import urlparse, parse_qs
+from io import BytesIO
 
 ROOT = Path(__file__).resolve().parent
 BANK = json.loads((ROOT / 'preguntas.json').read_text(encoding='utf-8'))
@@ -62,6 +64,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status); self.send_header('Content-Type',mime+'; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('Referrer-Policy','same-origin'); self.send_header('Content-Length',str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def do_GET(self):
         if self.path.split('?')[0] in ('/','/index.html'): self.send((ROOT/'index.html').read_bytes(),mime='text/html')
+        elif urlparse(self.path).path=='/qr.svg':
+            code=parse_qs(urlparse(self.path).query).get('sala',[''])[0]
+            if len(code)!=6 or not code.isascii() or not code.isdigit():
+                self.send({'error':'Código de sala no válido'},400); return
+            import qrcode
+            from qrcode.image.svg import SvgPathImage
+            invite='https://batalla-linfatica.onrender.com/?sala='+code
+            qr=qrcode.make(invite,image_factory=SvgPathImage,box_size=8,border=4,
+                           error_correction=qrcode.constants.ERROR_CORRECT_M)
+            data=BytesIO(); qr.save(data)
+            self.send(data.getvalue(),mime='image/svg+xml')
         elif self.path=='/health': self.send({'ok':True})
         else: self.send({'error':'No encontrado'},404)
     def do_POST(self):
@@ -107,7 +120,8 @@ class Handler(BaseHTTPRequestHandler):
                 if action=='/api/next':
                     if token!=r['host']: raise ValueError('Solo el anfitrión puede avanzar.')
                     if r['phase']=='question': raise ValueError('La ronda todavía está en marcha.')
-                    if r['phase']=='lobby' and not r['players']: raise ValueError('Espera a que entre algún jugador.')
+                    if r['phase']=='lobby' and not r['players']:
+                        r['players'][token]=dict(name='Tú · modo individual',score=0,answer=None,gain=0,streak=0,best=0,hits=0)
                     if r['phase'] not in ('lobby','reveal'): raise ValueError('La partida terminó.')
                     r['index']+=1
                     if r['index']>=len(r['questions']): r['phase']='finished'
