@@ -14,9 +14,11 @@ def clean_avatar(value):
     limits={'shape':11,'color':5,'face':2,'hat':4}
     return {key:max(0,min(limit,v)) if isinstance(v:=value.get(key,0),int) else 0 for key,limit in limits.items()}
 
-def make_questions(count):
+def make_questions(count,topic='all'):
+    if topic not in ('all','linfatico','snc'): raise ValueError('Tema no válido.')
+    pool=[r for r in BANK if topic=='all' or (r[4] if len(r)>4 else 'linfatico')==topic]
     questions=[]
-    for row in random.sample(BANK,count):
+    for row in random.sample(pool,min(count,len(pool))):
         pairs=list(enumerate(row[1])); random.shuffle(pairs)
         questions.append(dict(text=row[0],options=[p[1] for p in pairs],correct=next(i for i,p in enumerate(pairs) if p[0]==0),explanation=row[2],kind=row[3]))
     return questions
@@ -62,6 +64,7 @@ def view(r, token):
     if not host and p is None: raise ValueError('Vuelve a entrar a la sala.')
     result = dict(phase=r['phase'], code=r['code'], host=host, index=r['index'] + 1, total=len(r['questions']), deadline=r.get('deadline',0), now=time.time(), players=sorted([dict(name=p['name'], score=p['score'], avatar=clean_avatar(p.get('avatar')), answered=p['answer'] is not None) for p in r['players'].values()], key=lambda p:-p['score']))
     result['run']=r.get('run','initial')
+    result['topic']=r.get('topic','all')
     if r['phase'] in ('question','reveal'):
         q = r['questions'][r['index']]
         result['question'] = dict(text=q['text'], options=q['options'], kind=q['kind'])
@@ -110,10 +113,11 @@ class Handler(BaseHTTPRequestHandler):
                     code=str(secrets.randbelow(900000)+100000)
                     while code in rooms: code=str(secrets.randbelow(900000)+100000)
                     count=int(d.get('count',15))
-                    if count not in (10,15,30): raise ValueError('Elige 10, 15 o 30 preguntas.')
-                    questions=make_questions(count)
+                    if count not in (10,15,30,45): raise ValueError('Elige 10, 15, 30 o 45 preguntas.')
+                    topic=str(d.get('topic','all'))
+                    questions=make_questions(count,topic)
                     token=secrets.token_urlsafe(24)
-                    rooms[code]=dict(code=code,host=token,hostAvatar=clean_avatar(d.get('avatar')),run=secrets.token_hex(6),questions=questions,phase='lobby',index=-1,players={})
+                    rooms[code]=dict(code=code,host=token,hostAvatar=clean_avatar(d.get('avatar')),run=secrets.token_hex(6),topic=topic,questions=questions,phase='lobby',index=-1,players={})
                     return dict(code=code,token=token)
                 code=str(d.get('code','')); token=str(d.get('token','')); r=rooms.get(code)
                 if r is None: raise ValueError('No encontramos esa sala. Revisa el código.')
@@ -135,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
                 if action=='/api/restart':
                     if token!=r['host']: raise ValueError('Solo el anfitrión puede reiniciar la partida.')
                     if r['phase']=='closed': raise ValueError('La sala ya está cerrada.')
-                    r.update(phase='lobby',index=-1,run=secrets.token_hex(6),questions=make_questions(len(r['questions'])))
+                    r.update(phase='lobby',index=-1,run=secrets.token_hex(6),questions=make_questions(len(r['questions']),r.get('topic','all')))
                     for p in r['players'].values(): p.update(score=0,answer=None,gain=0,streak=0,best=0,hits=0)
                     return view(r,token)
                 advance(r)
