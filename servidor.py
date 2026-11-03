@@ -11,12 +11,35 @@ ROOMS = {}
 LOCK = threading.RLock()
 def clean_avatar(value):
     value=value if isinstance(value,dict) else {}
-    limits={'shape':11,'color':5,'face':2,'hat':4}
+    limits={'shape':17,'color':5,'face':2,'hat':4}
     return {key:max(0,min(limit,v)) if isinstance(v:=value.get(key,0),int) else 0 for key,limit in limits.items()}
 
-def make_questions(count,topic='all'):
-    if topic not in ('all','linfatico','snc'): raise ValueError('Tema no válido.')
-    pool=[r for r in BANK if topic=='all' or (r[4] if len(r)>4 else 'linfatico')==topic]
+def validate_custom_bank(bank):
+    if not isinstance(bank,dict): raise ValueError('Banco de preguntas no válido.')
+    name=str(bank.get('name','')).strip()[:80]
+    items=bank.get('questions')
+    if not name or not isinstance(items,list) or not 1<=len(items)<=100:
+        raise ValueError('El banco debe tener nombre y entre 1 y 100 preguntas.')
+    if len(json.dumps(bank,ensure_ascii=False).encode())>200000: raise ValueError('El banco es demasiado grande. Reduce el texto o el número de preguntas.')
+    rows=[]
+    for item in items:
+        if not isinstance(item,dict): raise ValueError('Pregunta no válida.')
+        text=item.get('text'); options=item.get('options'); answer=item.get('correct'); explanation=item.get('explanation','')
+        if not isinstance(text,str) or not text.strip() or len(text)>800: raise ValueError('Cada pregunta debe tener entre 1 y 800 caracteres.')
+        if not isinstance(options,list) or not 2<=len(options)<=4 or any(not isinstance(o,str) or not o.strip() or len(o)>200 for o in options): raise ValueError('Usa entre 2 y 4 opciones, de hasta 200 caracteres cada una.')
+        options=[o.strip() for o in options]
+        if len(set(o.casefold() for o in options))!=len(options): raise ValueError('Las opciones de una pregunta deben ser diferentes.')
+        if type(answer) is not int or not 0<=answer<len(options): raise ValueError('Selecciona una respuesta correcta válida.')
+        if not isinstance(explanation,str) or len(explanation)>1000: raise ValueError('La explicación debe tener hasta 1000 caracteres.')
+        choices=[options[answer]]+[o for i,o in enumerate(options) if i!=answer]
+        rows.append([text.strip(),choices,explanation.strip() or 'Respuesta correcta: '+options[answer]+'.','Banco personal','custom'])
+    return name,rows
+
+def make_questions(count,topic='all',custom_rows=None):
+    if topic=='custom' and custom_rows: pool=custom_rows
+    else:
+        if topic not in ('all','linfatico','snc'): raise ValueError('Tema no válido.')
+        pool=[r for r in BANK if topic=='all' or (r[4] if len(r)>4 else 'linfatico')==topic]
     questions=[]
     for row in random.sample(pool,min(count,len(pool))):
         pairs=list(enumerate(row[1])); random.shuffle(pairs)
@@ -65,6 +88,7 @@ def view(r, token):
     result = dict(phase=r['phase'], code=r['code'], host=host, index=r['index'] + 1, total=len(r['questions']), deadline=r.get('deadline',0), now=time.time(), players=sorted([dict(name=p['name'], score=p['score'], avatar=clean_avatar(p.get('avatar')), answered=p['answer'] is not None) for p in r['players'].values()], key=lambda p:-p['score']))
     result['run']=r.get('run','initial')
     result['topic']=r.get('topic','all')
+    result['bankName']=r.get('bankName','')
     if r['phase'] in ('question','reveal'):
         q = r['questions'][r['index']]
         result['question'] = dict(text=q['text'], options=q['options'], kind=q['kind'])
@@ -81,6 +105,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split('?')[0] in ('/','/index.html'): self.send((ROOT/'index.html').read_bytes(),mime='text/html')
         elif self.path=='/fiesta.js': self.send((ROOT/'fiesta.js').read_bytes(),mime='text/javascript')
         elif self.path=='/fiesta.css': self.send((ROOT/'fiesta.css').read_bytes(),mime='text/css')
+        elif self.path=='/bancos.js': self.send((ROOT/'bancos.js').read_bytes(),mime='text/javascript')
+        elif self.path=='/bancos.css': self.send((ROOT/'bancos.css').read_bytes(),mime='text/css')
         elif urlparse(self.path).path=='/qr.svg':
             code=parse_qs(urlparse(self.path).query).get('sala',[''])[0]
             if len(code)!=6 or not code.isascii() or not code.isdigit():
@@ -97,7 +123,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length=int(self.headers.get('Content-Length',0))
-            if length<2 or length>4096: raise ValueError('Solicitud demasiado grande o vacía.')
+            if length<2 or length>262144: raise ValueError('Solicitud demasiado grande o vacía. El máximo es 256 KB.')
             d=json.loads(self.rfile.read(length))
             if not isinstance(d,dict): raise ValueError('Solicitud no válida.')
             self.send(self.process(d))
@@ -113,11 +139,15 @@ class Handler(BaseHTTPRequestHandler):
                     code=str(secrets.randbelow(900000)+100000)
                     while code in rooms: code=str(secrets.randbelow(900000)+100000)
                     count=int(d.get('count',15))
-                    if count not in (10,15,30,45): raise ValueError('Elige 10, 15, 30 o 45 preguntas.')
                     topic=str(d.get('topic','all'))
-                    questions=make_questions(count,topic)
+                    custom_rows=None; bank_name=''
+                    if d.get('customBank') is not None:
+                        bank_name,custom_rows=validate_custom_bank(d['customBank']); topic='custom'
+                        if not 1<=count<=100: raise ValueError('Elige entre 1 y 100 preguntas.')
+                    elif count not in (10,15,30,45): raise ValueError('Elige 10, 15, 30 o 45 preguntas.')
+                    questions=make_questions(count,topic,custom_rows)
                     token=secrets.token_urlsafe(24)
-                    rooms[code]=dict(code=code,host=token,hostAvatar=clean_avatar(d.get('avatar')),run=secrets.token_hex(6),topic=topic,questions=questions,phase='lobby',index=-1,players={})
+                    rooms[code]=dict(code=code,host=token,hostAvatar=clean_avatar(d.get('avatar')),run=secrets.token_hex(6),topic=topic,bankName=bank_name,customRows=custom_rows,questions=questions,phase='lobby',index=-1,players={})
                     return dict(code=code,token=token)
                 code=str(d.get('code','')); token=str(d.get('token','')); r=rooms.get(code)
                 if r is None: raise ValueError('No encontramos esa sala. Revisa el código.')
@@ -139,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
                 if action=='/api/restart':
                     if token!=r['host']: raise ValueError('Solo el anfitrión puede reiniciar la partida.')
                     if r['phase']=='closed': raise ValueError('La sala ya está cerrada.')
-                    r.update(phase='lobby',index=-1,run=secrets.token_hex(6),questions=make_questions(len(r['questions']),r.get('topic','all')))
+                    r.update(phase='lobby',index=-1,run=secrets.token_hex(6),questions=make_questions(len(r['questions']),r.get('topic','all'),r.get('customRows')))
                     for p in r['players'].values(): p.update(score=0,answer=None,gain=0,streak=0,best=0,hits=0)
                     return view(r,token)
                 advance(r)
